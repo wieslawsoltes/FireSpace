@@ -3,8 +3,9 @@ mod scan;
 mod widgets;
 
 use std::env;
+use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -64,8 +65,17 @@ struct ScanSummary {
     skipped: usize,
 }
 
+#[derive(Clone, Debug)]
+struct DiskEntry {
+    name: String,
+    path: PathBuf,
+}
+
 struct AppState {
     path_input: String,
+    available_disks: Vec<DiskEntry>,
+    selected_disk: Option<usize>,
+    disk_menu_open: bool,
     scanning: bool,
     scan_sender: Option<UnboundedSender<ScanRequest>>,
     cancel_flag: Option<Arc<AtomicBool>>,
@@ -84,8 +94,13 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         let default_path = default_scan_path();
+        let available_disks = list_disks();
+        let selected_disk = disk_index_for_path(&available_disks, &default_path);
         Self {
             path_input: default_path.display().to_string(),
+            available_disks,
+            selected_disk,
+            disk_menu_open: false,
             scanning: false,
             scan_sender: None,
             cancel_flag: None,
@@ -114,6 +129,7 @@ impl AppState {
         if self.scanning {
             return;
         }
+        self.disk_menu_open = false;
         let path = normalize_input_path(&self.path_input);
         if path.as_os_str().is_empty() {
             return;
@@ -234,6 +250,30 @@ impl AppState {
         self.hovered
     }
 
+    fn sync_selected_disk(&mut self) {
+        let path = normalize_input_path(&self.path_input);
+        self.selected_disk = disk_index_for_path(&self.available_disks, &path);
+    }
+
+    fn selected_disk_label(&self) -> String {
+        self.selected_disk
+            .and_then(|index| self.available_disks.get(index))
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| "Disk".to_string())
+    }
+
+    fn toggle_disk_menu(&mut self) {
+        self.disk_menu_open = !self.disk_menu_open;
+    }
+
+    fn select_disk(&mut self, index: usize) {
+        if let Some(entry) = self.available_disks.get(index) {
+            self.path_input = entry.path.display().to_string();
+            self.selected_disk = Some(index);
+        }
+        self.disk_menu_open = false;
+    }
+
     fn status_text(&self) -> String {
         if self.scanning {
             return format!("Scanning {}...", self.path_input.trim());
@@ -275,13 +315,30 @@ impl AppState {
 }
 
 fn app_logic(data: &mut AppState) -> impl WidgetView<AppState> + use<> {
-    let header = flex_row((
+    let disk_button = button(
+        label(format!("{} v", data.selected_disk_label()))
+            .text_size(12.0)
+            .color(xilem::Color::from_rgb8(230, 236, 246)),
+        |data: &mut AppState| {
+            data.toggle_disk_menu();
+        },
+    )
+    .disabled(data.scanning)
+    .padding(Padding::from_vh(6.0, 10.0))
+    .background_color(NAV_BG)
+    .corner_radius(7.0)
+    .border_width(0.0);
+
+    let header_row = flex_row((
         label("FireSpace")
             .text_size(20.0)
             .weight(xilem::FontWeight::BOLD),
         FlexSpacer::Fixed(10.px()),
+        disk_button,
+        FlexSpacer::Fixed(8.px()),
         text_input(data.path_input.clone(), |data: &mut AppState, value: String| {
             data.path_input = value;
+            data.sync_selected_disk();
         })
         .placeholder("Path to scan")
         .on_enter(|data: &mut AppState, _| {
@@ -322,8 +379,17 @@ fn app_logic(data: &mut AppState) -> impl WidgetView<AppState> + use<> {
     ))
     .cross_axis_alignment(CrossAxisAlignment::Center)
     .main_axis_alignment(MainAxisAlignment::Start)
-    .padding(10.0)
-    .background_color(APP_BG_DARK);
+    .padding(10.0);
+
+    let header: Box<xilem::AnyWidgetView<AppState>> = if data.disk_menu_open {
+        flex_col((header_row, disk_menu_view(data)))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .main_axis_alignment(MainAxisAlignment::Start)
+            .background_color(APP_BG_DARK)
+            .boxed()
+    } else {
+        header_row.background_color(APP_BG_DARK).boxed()
+    };
 
     let graph = flame_graph(
         data.tree.clone(),
@@ -661,6 +727,61 @@ fn panel_info(data: &AppState) -> Option<PanelInfo> {
     })
 }
 
+fn disk_menu_view(data: &AppState) -> impl WidgetView<AppState> + use<> {
+    let mut items: Vec<AnyFlexChild<AppState>> = Vec::new();
+    items.push(FlexSpacer::Fixed(6.px()).into_any_flex());
+    if data.available_disks.is_empty() {
+        items.push(
+            flex_row((
+                FlexSpacer::Fixed(6.px()),
+                label("No disks found")
+                    .text_size(11.0)
+                    .color(xilem::Color::from_rgb8(150, 160, 176)),
+            ))
+            .padding(Padding::from_vh(6.0, 10.0))
+            .into_any_flex(),
+        );
+    } else {
+        for (index, entry) in data.available_disks.iter().enumerate() {
+            let name = entry.name.clone();
+            let path = entry.path.display().to_string();
+            let is_selected = data.selected_disk == Some(index);
+            let bg = if is_selected { CHIP_BG_ACTIVE } else { CHIP_BG };
+            items.push(
+                button(
+                    flex_row((
+                        label(name)
+                            .text_size(12.0)
+                            .color(xilem::Color::from_rgb8(230, 236, 246)),
+                        FlexSpacer::Fixed(8.px()),
+                        label(path)
+                            .text_size(10.0)
+                            .color(xilem::Color::from_rgb8(140, 150, 170)),
+                    ))
+                    .cross_axis_alignment(CrossAxisAlignment::Center)
+                    .main_axis_alignment(MainAxisAlignment::Start),
+                    move |data: &mut AppState| {
+                        data.select_disk(index);
+                    },
+                )
+                .padding(Padding::from_vh(6.0, 10.0))
+                .background_color(bg)
+                .corner_radius(6.0)
+                .border_width(0.0)
+                .into_any_flex(),
+            );
+            items.push(FlexSpacer::Fixed(4.px()).into_any_flex());
+        }
+    }
+    items.push(FlexSpacer::Fixed(2.px()).into_any_flex());
+
+    flex_col(items)
+        .cross_axis_alignment(CrossAxisAlignment::Start)
+        .main_axis_alignment(MainAxisAlignment::Start)
+        .padding(Padding::from_vh(0.0, 10.0))
+        .background_color(APP_BG_DARKER)
+}
+
 fn breadcrumb_nodes(tree: &FsTree, focus: usize) -> Vec<usize> {
     let mut nodes = Vec::new();
     let mut current = Some(focus);
@@ -761,6 +882,116 @@ fn default_scan_path() -> PathBuf {
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn disk_index_for_path(disks: &[DiskEntry], path: &Path) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for (index, entry) in disks.iter().enumerate() {
+        if path.starts_with(&entry.path) {
+            let depth = entry.path.components().count();
+            if best.map_or(true, |(_, best_depth)| depth > best_depth) {
+                best = Some((index, depth));
+            }
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+#[cfg(target_os = "windows")]
+fn list_disks() -> Vec<DiskEntry> {
+    let mut disks = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let path = PathBuf::from(format!("{}:\\", letter as char));
+        if let Ok(metadata) = fs::metadata(&path) {
+            if metadata.is_dir() {
+                disks.push(DiskEntry {
+                    name: format!("{}:", letter as char),
+                    path,
+                });
+            }
+        }
+    }
+    if disks.is_empty() {
+        disks.push(DiskEntry {
+            name: "Disk".to_string(),
+            path: default_scan_path(),
+        });
+    }
+    disks
+}
+
+#[cfg(target_os = "macos")]
+fn list_disks() -> Vec<DiskEntry> {
+    let mut disks = Vec::new();
+    disks.push(DiskEntry {
+        name: "/".to_string(),
+        path: PathBuf::from("/"),
+    });
+    let data_path = PathBuf::from("/System/Volumes/Data");
+    if data_path.exists() {
+        disks.push(DiskEntry {
+            name: "Data".to_string(),
+            path: data_path,
+        });
+    }
+    append_volume_dirs(&mut disks, "/Volumes");
+    if disks.is_empty() {
+        disks.push(DiskEntry {
+            name: "Disk".to_string(),
+            path: default_scan_path(),
+        });
+    }
+    disks
+}
+
+#[cfg(target_os = "linux")]
+fn list_disks() -> Vec<DiskEntry> {
+    let mut disks = Vec::new();
+    disks.push(DiskEntry {
+        name: "/".to_string(),
+        path: PathBuf::from("/"),
+    });
+    append_volume_dirs(&mut disks, "/mnt");
+    append_volume_dirs(&mut disks, "/media");
+    if let Ok(user) = env::var("USER") {
+        append_volume_dirs(&mut disks, &format!("/run/media/{user}"));
+    }
+    if disks.is_empty() {
+        disks.push(DiskEntry {
+            name: "Disk".to_string(),
+            path: default_scan_path(),
+        });
+    }
+    disks
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn list_disks() -> Vec<DiskEntry> {
+    vec![DiskEntry {
+        name: "Disk".to_string(),
+        path: default_scan_path(),
+    }]
+}
+
+fn append_volume_dirs(disks: &mut Vec<DiskEntry>, base: &str) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(metadata) = entry.metadata() {
+            if !metadata.is_dir() {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        disks.push(DiskEntry { name, path });
+    }
 }
 
 fn normalize_input_path(input: &str) -> PathBuf {
