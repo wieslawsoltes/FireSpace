@@ -2,6 +2,8 @@
 
 FireSpace is a cross-platform disk space analyzer written in Rust. It pairs a fast, parallel scanner with a flame-graph style visualization built on Vello for rendering and Xilem for UI.
 
+<img width="2624" height="1920" alt="image" src="https://github.com/user-attachments/assets/4226f520-ae42-4621-8a6e-842e3c2e8c4a" />
+
 ## Highlights
 
 - Radial and classic flame-graph views for directory size visualization.
